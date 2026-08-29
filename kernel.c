@@ -31,6 +31,30 @@ static uint16_t vga_entry(char character, uint8_t color) {
     return (uint16_t)character | ((uint16_t)color << 8);
 }
 
+/* 向 x86 I/O 端口写入一个字节。 */
+static void outb(uint16_t port, uint8_t value) {
+    /* 使用 outb 指令，将 value 写入 DX 指定的端口。 */
+    __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port));
+}
+
+/* 将当前终端行列位置同步到 VGA 文本模式的硬件光标。 */
+static void terminal_update_cursor(void) {
+    /* 计算当前光标在 80 × 25 文本模式中的线性位置。 */
+    const uint16_t position = terminal_row * VGA_WIDTH + terminal_column;
+
+    /* 选择 VGA CRT 控制器的“光标位置高字节”寄存器。 */
+    outb(0x3D4, 14);
+
+    /* 写入光标位置的高 8 位。 */
+    outb(0x3D5, (uint8_t)(position >> 8));
+
+    /* 选择 VGA CRT 控制器的“光标位置低字节”寄存器。 */
+    outb(0x3D4, 15);
+
+    /* 写入光标位置的低 8 位。 */
+    outb(0x3D5, (uint8_t)position);
+}
+
 /* 将整个 80 × 25 的 VGA 文本屏幕填充为空格。 */
 static void terminal_clear(void) {
     /* 逐行处理屏幕。 */
@@ -50,6 +74,9 @@ static void terminal_clear(void) {
 
     /* 清屏后将下一次输出位置重置到第 0 列。 */
     terminal_column = 0;
+
+    /* 将硬件光标移动到清屏后的左上角。 */
+    terminal_update_cursor();
 }
 
 /* 将屏幕第 2 到第 25 行向上复制一行，并清空新的最后一行。 */
@@ -95,6 +122,9 @@ static void terminal_newline(void) {
         /* 将光标放在滚屏后空出的最后一行。 */
         terminal_row = VGA_HEIGHT - 1;
     }
+
+    /* 将新的行列位置同步到 VGA 硬件光标。 */
+    terminal_update_cursor();
 }
 
 /* 以给定颜色输出一个字符，并自动更新终端光标位置。 */
@@ -121,7 +151,13 @@ static void terminal_putchar(char character, uint8_t color) {
     if (terminal_column == VGA_WIDTH) {
         /* 执行自动换行操作。 */
         terminal_newline();
+
+        /* 自动换行已经同步了硬件光标，因此直接返回。 */
+        return;
     }
+
+    /* 将同一行内移动后的列位置同步到 VGA 硬件光标。 */
+    terminal_update_cursor();
 }
 
 /* 从当前光标位置开始，以给定颜色输出一个以 0 结尾的字符串。 */
@@ -158,12 +194,6 @@ void kernel_main(void) {
 
     /* 输出一条说明，提示终端现在可以处理滚屏。 */
     terminal_write("Newline and scrolling are ready.\n", COLOR_LIGHT_GREY);
-
-    /* 连续输出 30 行，以触发超过 25 行时的滚屏逻辑。 */
-    for (uint16_t line = 0; line < 30; ++line) {
-        /* 输出一行滚屏测试文本。 */
-        terminal_write("scroll test line\n", COLOR_LIGHT_GREY);
-    }
 
     /* 内核不能返回到不存在的操作系统，因此永久停在这里。 */
     for (;;) {
