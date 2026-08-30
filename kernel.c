@@ -34,8 +34,8 @@ static uint16_t terminal_row;
 /* 保存终端下一次输出所在的屏幕列。 */
 static uint16_t terminal_column;
 
-/* 声明汇编文件提供的“除以零异常”入口地址。 */
-extern void isr_divide_by_zero(void);
+/* 声明汇编文件提供的 32 个异常入口地址组成的表。 */
+extern void (*exception_stub_table[32])(void);
 
 /* 定义 IDT 中单个 8 字节门描述符的内存布局。 */
 struct idt_entry {
@@ -217,6 +217,24 @@ static void terminal_write(const char *text, uint8_t color) {
     }
 }
 
+/* 以十六进制格式输出一个 32 位无符号整数，便于阅读异常号和错误码。 */
+static void terminal_write_hex32(uint32_t value, uint8_t color) {
+    /* 定义十六进制数字到 ASCII 字符的映射表。 */
+    const char *digits = "0123456789ABCDEF";
+
+    /* 输出十六进制数的常用前缀。 */
+    terminal_write("0x", color);
+
+    /* 从最高的第 7 个十六进制数字开始处理。 */
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        /* 取出当前 4 个二进制位，得到一个 0 到 15 的数字。 */
+        const uint8_t digit = (uint8_t)((value >> shift) & 0x0F);
+
+        /* 输出该数字对应的十六进制 ASCII 字符。 */
+        terminal_putchar(digits[digit], color);
+    }
+}
+
 /* 在 IDT 的指定向量位置安装一个 32 位中断门。 */
 static void idt_set_gate(uint8_t vector, void (*handler)(void)) {
     /* 将函数指针转换为可拆分的 32 位处理函数地址。 */
@@ -244,22 +262,40 @@ static void idt_load(const struct idt_pointer *pointer) {
     __asm__ volatile ("lidtl (%0)" : : "r"(pointer) : "memory");
 }
 
-/* 建立并加载当前最小 IDT；目前只安装除以零异常处理函数。 */
+/* 建立并加载异常向量 0 到 31 的最小 IDT。 */
 static void idt_initialize(void) {
     /* 创建 lidt 所需的 IDT 描述符，base 指向 idt 数组。 */
     const struct idt_pointer pointer = { (uint16_t)(sizeof(idt) - 1), (uint32_t)idt };
 
-    /* 将 CPU 异常向量 0 连接到汇编异常入口。 */
-    idt_set_gate(0, isr_divide_by_zero);
+    /* 逐项将 32 个 CPU 异常向量连接到对应的汇编异常入口。 */
+    for (uint8_t vector = 0; vector < 32; ++vector) {
+        /* 将当前向量的门描述符写入 IDT。 */
+        idt_set_gate(vector, exception_stub_table[vector]);
+    }
 
-    /* 将描述符写入 CPU 的 IDTR，使异常向量 0 从此由我们的 IDT 处理。 */
+    /* 将描述符写入 CPU 的 IDTR，使异常向量 0 到 31 从此由我们的 IDT 处理。 */
     idt_load(&pointer);
 }
 
-/* 这是汇编异常入口调用的 C 函数；除以零异常不能安全返回，因此停机。 */
-void divide_by_zero_handler(void) {
-    /* 在终端中留下清晰的异常诊断信息。 */
-    terminal_write("\nEXCEPTION: divide by zero\n", COLOR_LIGHT_RED);
+/* 这是所有汇编异常入口调用的 C 函数；当前任意异常都显示信息后停机。 */
+void exception_handler(uint32_t vector, uint32_t error_code) {
+    /* 在终端中留下通用异常标题。 */
+    terminal_write("\nEXCEPTION\n", COLOR_LIGHT_RED);
+
+    /* 输出当前异常向量编号。 */
+    terminal_write("vector: ", COLOR_LIGHT_RED);
+
+    /* 以十六进制形式输出当前异常向量编号。 */
+    terminal_write_hex32(vector, COLOR_LIGHT_RED);
+
+    /* 在输出错误码前换行。 */
+    terminal_write("\nerror:  ", COLOR_LIGHT_RED);
+
+    /* 以十六进制形式输出 CPU 或异常入口提供的错误码。 */
+    terminal_write_hex32(error_code, COLOR_LIGHT_RED);
+
+    /* 异常诊断信息输出完成后换行。 */
+    terminal_write("\n", COLOR_LIGHT_RED);
 
     /* 因异常现场尚未实现恢复逻辑，永久停止 CPU。 */
     for (;;) {
@@ -300,7 +336,7 @@ void kernel_main(void) {
     /* 输出一条说明，提示终端现在可以处理滚屏。 */
     terminal_write("Newline and scrolling are ready.\n", COLOR_LIGHT_GREY);
 
-    /* 建立并加载最小 IDT，使 CPU 能找到我们的除以零异常处理函数。 */
+    /* 建立并加载异常 IDT，使 CPU 能找到向量 0 到 31 的异常处理函数。 */
     idt_initialize();
 
     /* 提示接下来会主动触发一个受控异常。 */
