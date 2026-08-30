@@ -49,6 +49,12 @@ enum { KEYBOARD_DATA_PORT = 0x60 };
 /* 希望 PIT 每秒触发的中断次数。 */
 enum { PIT_FREQUENCY = 100 };
 
+/* 键盘环形缓冲区可容纳的字节数量；必须是 2 的幂以便用位运算回绕。 */
+enum { KEYBOARD_BUFFER_SIZE = 128 };
+
+/* 键盘环形缓冲区的掩码，用于将索引限制在 0 到 127。 */
+enum { KEYBOARD_BUFFER_MASK = KEYBOARD_BUFFER_SIZE - 1 };
+
 /* IDT 中断向量的总数量。 */
 enum { IDT_ENTRIES = 256 };
 
@@ -69,6 +75,15 @@ extern void irq1(void);
 
 /* 保存已经发生的 PIT 定时器中断次数。 */
 static volatile uint32_t timer_ticks;
+
+/* 保存键盘中断写入、主循环读取的 ASCII 字符；volatile 防止编译器缓存其内容。 */
+static volatile char keyboard_buffer[KEYBOARD_BUFFER_SIZE];
+
+/* 保存下一次键盘字符写入的位置；IRQ1 是唯一写入者。 */
+static volatile uint8_t keyboard_head;
+
+/* 保存下一次键盘字符读取的位置；内核主循环是唯一读取者。 */
+static volatile uint8_t keyboard_tail;
 
 /* 定义 IDT 中单个 8 字节门描述符的内存布局。 */
 struct idt_entry {
@@ -471,6 +486,42 @@ static char keyboard_scancode_to_ascii(uint8_t scancode) {
     return map[scancode];
 }
 
+/* 将一个字符写入键盘环形缓冲区；缓冲区满时丢弃最新字符。 */
+static void keyboard_buffer_push(char character) {
+    /* 计算写入当前字符后，head 应移动到的位置。 */
+    const uint8_t next_head = (keyboard_head + 1) & KEYBOARD_BUFFER_MASK;
+
+    /* 如果 next_head 等于 tail，说明缓冲区已满。 */
+    if (next_head == keyboard_tail) {
+        /* 丢弃当前字符，保留已经在缓冲区中的较早输入。 */
+        return;
+    }
+
+    /* 将字符放入当前 head 指向的空闲单元。 */
+    keyboard_buffer[keyboard_head] = character;
+
+    /* 最后发布新的 head；主循环由此知道新字符已经可读。 */
+    keyboard_head = next_head;
+}
+
+/* 从键盘环形缓冲区取出一个字符；缓冲区为空时返回 0。 */
+static char keyboard_buffer_pop(void) {
+    /* 如果 head 与 tail 相等，说明当前没有待处理字符。 */
+    if (keyboard_head == keyboard_tail) {
+        /* 返回 0 表示读取失败或缓冲区为空。 */
+        return '\0';
+    }
+
+    /* 读取 tail 指向的最早一个待处理字符。 */
+    const char character = keyboard_buffer[keyboard_tail];
+
+    /* 将 tail 移到下一单元，并利用掩码在数组末尾回绕。 */
+    keyboard_tail = (keyboard_tail + 1) & KEYBOARD_BUFFER_MASK;
+
+    /* 将读取到的字符返回给内核主循环。 */
+    return character;
+}
+
 /* 这是 IRQ1 汇编入口调用的 C 函数；每次键盘事件读取一个扫描码。 */
 void keyboard_handler(void) {
     /* 从键盘控制器端口读取本次按键的 PS/2 Set 1 扫描码。 */
@@ -487,8 +538,8 @@ void keyboard_handler(void) {
 
     /* 只有已映射的字符才输出到内核终端。 */
     if (character != '\0') {
-        /* 将键盘字符以浅灰色写入当前终端光标位置。 */
-        terminal_putchar(character, COLOR_LIGHT_GREY);
+        /* 将字符放进缓冲区，交给非中断上下文的主循环处理。 */
+        keyboard_buffer_push(character);
     }
 }
 
@@ -542,9 +593,21 @@ void kernel_main(void) {
     /* 在 IDT、PIC 与 PIT 都准备好后，允许 CPU 接收硬件中断。 */
     enable_interrupts();
 
-    /* 内核不能返回到不存在的操作系统，因此永久停在这里。 */
+    /* 内核主循环持续消费键盘缓冲区中的字符。 */
     for (;;) {
-        /* 让 CPU 暂停，直到不可屏蔽事件唤醒它。 */
+        /* 从键盘环形缓冲区尝试取出一个字符。 */
+        const char character = keyboard_buffer_pop();
+
+        /* 如果读到了一个有效字符，将它回显到内核终端。 */
+        if (character != '\0') {
+            /* 在非中断上下文中安全调用终端输出函数。 */
+            terminal_putchar(character, COLOR_LIGHT_GREY);
+
+            /* 已处理一个字符，立即继续检查缓冲区是否还有更多输入。 */
+            continue;
+        }
+
+        /* 缓冲区为空时暂停 CPU，等待下一次硬件中断将它唤醒。 */
         __asm__ volatile ("hlt");
     }
 }
