@@ -25,6 +25,27 @@ enum { COLOR_LIGHT_GREEN = 0x0A };
 /* VGA 颜色值：黑色背景、浅红色前景。 */
 enum { COLOR_LIGHT_RED = 0x0C };
 
+/* 8259 主 PIC 的命令端口。 */
+enum { PIC_MASTER_COMMAND = 0x20 };
+
+/* 8259 主 PIC 的数据端口。 */
+enum { PIC_MASTER_DATA = 0x21 };
+
+/* 8259 从 PIC 的命令端口。 */
+enum { PIC_SLAVE_COMMAND = 0xA0 };
+
+/* 8259 从 PIC 的数据端口。 */
+enum { PIC_SLAVE_DATA = 0xA1 };
+
+/* PIT 通道 0 的数据端口。 */
+enum { PIT_CHANNEL_0 = 0x40 };
+
+/* PIT 模式控制端口。 */
+enum { PIT_COMMAND = 0x43 };
+
+/* 希望 PIT 每秒触发的中断次数。 */
+enum { PIT_FREQUENCY = 100 };
+
 /* IDT 中断向量的总数量。 */
 enum { IDT_ENTRIES = 256 };
 
@@ -36,6 +57,12 @@ static uint16_t terminal_column;
 
 /* 声明汇编文件提供的 32 个异常入口地址组成的表。 */
 extern void (*exception_stub_table[32])(void);
+
+/* 声明汇编文件提供的 PIT 定时器 IRQ0 入口地址。 */
+extern void irq0(void);
+
+/* 保存已经发生的 PIT 定时器中断次数。 */
+static volatile uint32_t timer_ticks;
 
 /* 定义 IDT 中单个 8 字节门描述符的内存布局。 */
 struct idt_entry {
@@ -77,6 +104,12 @@ static uint16_t vga_entry(char character, uint8_t color) {
 static void outb(uint16_t port, uint8_t value) {
     /* 使用 outb 指令，将 value 写入 DX 指定的端口。 */
     __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port));
+}
+
+/* 在两次 PIC 配置写入之间插入一个短暂 I/O 延迟。 */
+static void io_wait(void) {
+    /* 向传统延迟端口 0x80 写入 0，让慢速硬件有时间接收前一条命令。 */
+    outb(0x80, 0);
 }
 
 /* 将当前终端行列位置同步到 VGA 文本模式的硬件光标。 */
@@ -273,8 +306,89 @@ static void idt_initialize(void) {
         idt_set_gate(vector, exception_stub_table[vector]);
     }
 
+    /* 将 PIC 主片的 IRQ0 映射到 IDT 向量 32。 */
+    idt_set_gate(32, irq0);
+
     /* 将描述符写入 CPU 的 IDTR，使异常向量 0 到 31 从此由我们的 IDT 处理。 */
     idt_load(&pointer);
+}
+
+/* 将两片 8259 PIC 的 IRQ 范围重映射到 IDT 向量 32 到 47。 */
+static void pic_remap(void) {
+    /* 发送主 PIC 初始化命令：需要 ICW4。 */
+    outb(PIC_MASTER_COMMAND, 0x11);
+
+    /* 等待主 PIC 接收初始化命令。 */
+    io_wait();
+
+    /* 发送从 PIC 初始化命令：需要 ICW4。 */
+    outb(PIC_SLAVE_COMMAND, 0x11);
+
+    /* 等待从 PIC 接收初始化命令。 */
+    io_wait();
+
+    /* 设置主 PIC 的中断向量起始值为 32。 */
+    outb(PIC_MASTER_DATA, 0x20);
+
+    /* 等待主 PIC 接收向量偏移。 */
+    io_wait();
+
+    /* 设置从 PIC 的中断向量起始值为 40。 */
+    outb(PIC_SLAVE_DATA, 0x28);
+
+    /* 等待从 PIC 接收向量偏移。 */
+    io_wait();
+
+    /* 告诉主 PIC：从 PIC 接在主 PIC 的 IRQ2 线上。 */
+    outb(PIC_MASTER_DATA, 0x04);
+
+    /* 等待主 PIC 接收级联信息。 */
+    io_wait();
+
+    /* 告诉从 PIC：它的级联身份是 IRQ2。 */
+    outb(PIC_SLAVE_DATA, 0x02);
+
+    /* 等待从 PIC 接收级联信息。 */
+    io_wait();
+
+    /* 设置主 PIC 使用 8086 模式。 */
+    outb(PIC_MASTER_DATA, 0x01);
+
+    /* 等待主 PIC 接收模式信息。 */
+    io_wait();
+
+    /* 设置从 PIC 使用 8086 模式。 */
+    outb(PIC_SLAVE_DATA, 0x01);
+
+    /* 等待从 PIC 接收模式信息。 */
+    io_wait();
+
+    /* 仅打开主 PIC 的 IRQ0，屏蔽 IRQ1 到 IRQ7。 */
+    outb(PIC_MASTER_DATA, 0xFE);
+
+    /* 屏蔽从 PIC 的全部 IRQ8 到 IRQ15。 */
+    outb(PIC_SLAVE_DATA, 0xFF);
+}
+
+/* 配置 PIT 通道 0，使其每秒产生大约 100 次 IRQ0。 */
+static void pit_initialize(void) {
+    /* PIT 输入时钟约为 1,193,182 Hz；除以 100 得到每次中断的计数值。 */
+    const uint16_t divisor = (uint16_t)(1193182 / PIT_FREQUENCY);
+
+    /* 选择通道 0、先写低字节再写高字节、模式 3 方波发生器、二进制计数。 */
+    outb(PIT_COMMAND, 0x36);
+
+    /* 写入计数值的低 8 位。 */
+    outb(PIT_CHANNEL_0, (uint8_t)divisor);
+
+    /* 写入计数值的高 8 位。 */
+    outb(PIT_CHANNEL_0, (uint8_t)(divisor >> 8));
+}
+
+/* 开启 CPU 的可屏蔽硬件中断，使 PIT 的 IRQ0 可以到达 IDT。 */
+static void enable_interrupts(void) {
+    /* 执行 sti 指令，将 EFLAGS 中的 IF 标志位置为 1。 */
+    __asm__ volatile ("sti");
 }
 
 /* 这是所有汇编异常入口调用的 C 函数；当前任意异常都显示信息后停机。 */
@@ -301,6 +415,21 @@ void exception_handler(uint32_t vector, uint32_t error_code) {
     for (;;) {
         /* 让 CPU 休眠，避免在异常状态下继续执行未知代码。 */
         __asm__ volatile ("hlt");
+    }
+}
+
+/* 这是 IRQ0 汇编入口调用的 C 函数；每 100 个时钟节拍输出一次状态信息。 */
+void timer_handler(void) {
+    /* 记录这一次 PIT 定时器中断。 */
+    ++timer_ticks;
+
+    /* 100 Hz 配置下，累计 100 次中断约等于经过一秒。 */
+    if (timer_ticks == PIT_FREQUENCY) {
+        /* 从零重新开始统计下一秒。 */
+        timer_ticks = 0;
+
+        /* 输出一行文字，证明硬件定时器中断正被持续处理。 */
+        terminal_write("timer IRQ0: one second elapsed\n", COLOR_LIGHT_GREEN);
     }
 }
 
@@ -339,11 +468,20 @@ void kernel_main(void) {
     /* 建立并加载异常 IDT，使 CPU 能找到向量 0 到 31 的异常处理函数。 */
     idt_initialize();
 
-    /* 提示接下来会主动触发一个受控异常。 */
-    terminal_write("IDT loaded; triggering divide by zero...\n", COLOR_LIGHT_GREY);
+    /* 输出 PIC 即将映射硬件 IRQ 的状态信息。 */
+    terminal_write("IDT loaded; remapping PIC...\n", COLOR_LIGHT_GREY);
 
-    /* 故意执行除以零，以验证 CPU 是否跳进我们的异常入口。 */
-    trigger_divide_by_zero();
+    /* 将硬件 IRQ 从冲突的异常向量范围移到 32 到 47。 */
+    pic_remap();
+
+    /* 配置可周期性产生 IRQ0 的 PIT 定时器。 */
+    pit_initialize();
+
+    /* 输出硬件中断即将开启的状态信息。 */
+    terminal_write("PIT ready; enabling IRQ0 timer...\n", COLOR_LIGHT_GREY);
+
+    /* 在 IDT、PIC 与 PIT 都准备好后，允许 CPU 接收硬件中断。 */
+    enable_interrupts();
 
     /* 内核不能返回到不存在的操作系统，因此永久停在这里。 */
     for (;;) {

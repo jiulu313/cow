@@ -4,6 +4,8 @@ section .text                                ; 将异常入口与公共处理代
 
 extern exception_handler                     ; 声明由 kernel.c 提供的通用 C 异常处理函数。
 
+extern timer_handler                         ; 声明由 kernel.c 提供的 PIT 定时器 IRQ0 处理函数。
+
 %macro ISR_NO_ERROR_CODE 1                   ; 定义一个“CPU 不自动压入错误码”的异常入口模板。
 global isr%1                                 ; 导出当前异常向量的入口符号，例如 isr0。
 isr%1:                                        ; 定义当前异常向量的入口标签。
@@ -61,6 +63,16 @@ isr_common:                                   ; 所有异常入口最终都会�
     popa                                      ; 恢复异常发生前保存的通用寄存器。
     add esp, 8                                ; 移除规范化后的异常向量号与错误码。
     iret                                      ; 若 C 函数返回，使用中断返回指令恢复 EIP、CS 和 EFLAGS。
+
+global irq0                                  ; 导出 PIC 重映射后位于 IDT 向量 32 的定时器 IRQ0 入口。
+
+irq0:                                         ; PIT 定时器触发 IRQ0 时，CPU 通过 IDT[32] 跳入这里。
+    pusha                                     ; 保存通用寄存器，保护被中断的 C 代码现场。
+    call timer_handler                        ; 调用 C 定时器处理函数，更新时钟计数并按需输出信息。
+    popa                                      ; 恢复中断发生前的通用寄存器。
+    mov al, 0x20                              ; 准备 PIC 的“中断结束命令”EOI。
+    out 0x20, al                              ; 通知主 PIC：IRQ0 已处理完成，可以继续发送下一次中断。
+    iret                                      ; 从硬件中断返回，恢复被中断代码的 EIP、CS 和 EFLAGS。
 
 section .rodata                              ; 将异常入口地址表放入只读数据段。
 
