@@ -6,6 +6,8 @@ extern exception_handler                     ; 声明由 kernel.c 提供的通�
 
 extern timer_handler                         ; 声明由 kernel.c 提供的 PIT 定时器 IRQ0 处理函数。
 
+extern keyboard_handler                      ; 声明由 kernel.c 提供的键盘 IRQ1 处理函数。
+
 %macro ISR_NO_ERROR_CODE 1                   ; 定义一个“CPU 不自动压入错误码”的异常入口模板。
 global isr%1                                 ; 导出当前异常向量的入口符号，例如 isr0。
 isr%1:                                        ; 定义当前异常向量的入口标签。
@@ -72,6 +74,16 @@ irq0:                                         ; PIT 定时器触发 IRQ0 时，C
     popa                                      ; 恢复中断发生前的通用寄存器。
     mov al, 0x20                              ; 准备 PIC 的“中断结束命令”EOI。
     out 0x20, al                              ; 通知主 PIC：IRQ0 已处理完成，可以继续发送下一次中断。
+    iret                                      ; 从硬件中断返回，恢复被中断代码的 EIP、CS 和 EFLAGS。
+
+global irq1                                  ; 导出 PIC 重映射后位于 IDT 向量 33 的键盘 IRQ1 入口。
+
+irq1:                                         ; 键盘控制器触发 IRQ1 时，CPU 通过 IDT[33] 跳入这里。
+    pusha                                     ; 保存通用寄存器，保护被中断的 C 代码现场。
+    call keyboard_handler                     ; 调用 C 键盘处理函数，读取扫描码并显示可识别字符。
+    popa                                      ; 恢复中断发生前的通用寄存器。
+    mov al, 0x20                              ; 准备 PIC 的“中断结束命令”EOI。
+    out 0x20, al                              ; 通知主 PIC：IRQ1 已处理完成，可以继续接收后续按键。
     iret                                      ; 从硬件中断返回，恢复被中断代码的 EIP、CS 和 EFLAGS。
 
 section .rodata                              ; 将异常入口地址表放入只读数据段。

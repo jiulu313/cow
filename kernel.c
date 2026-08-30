@@ -43,6 +43,9 @@ enum { PIT_CHANNEL_0 = 0x40 };
 /* PIT 模式控制端口。 */
 enum { PIT_COMMAND = 0x43 };
 
+/* 键盘控制器读取扫描码的数据端口。 */
+enum { KEYBOARD_DATA_PORT = 0x60 };
+
 /* 希望 PIT 每秒触发的中断次数。 */
 enum { PIT_FREQUENCY = 100 };
 
@@ -60,6 +63,9 @@ extern void (*exception_stub_table[32])(void);
 
 /* 声明汇编文件提供的 PIT 定时器 IRQ0 入口地址。 */
 extern void irq0(void);
+
+/* 声明汇编文件提供的键盘 IRQ1 入口地址。 */
+extern void irq1(void);
 
 /* 保存已经发生的 PIT 定时器中断次数。 */
 static volatile uint32_t timer_ticks;
@@ -104,6 +110,18 @@ static uint16_t vga_entry(char character, uint8_t color) {
 static void outb(uint16_t port, uint8_t value) {
     /* 使用 outb 指令，将 value 写入 DX 指定的端口。 */
     __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port));
+}
+
+/* 从 x86 I/O 端口读取一个字节。 */
+static uint8_t inb(uint16_t port) {
+    /* 声明保存读取结果的局部变量。 */
+    uint8_t value;
+
+    /* 使用 inb 指令，从 port 读取一个字节到 AL，并保存到 value。 */
+    __asm__ volatile ("inb %1, %0" : "=a"(value) : "Nd"(port));
+
+    /* 将端口读取结果返回给调用者。 */
+    return value;
 }
 
 /* 在两次 PIC 配置写入之间插入一个短暂 I/O 延迟。 */
@@ -309,6 +327,9 @@ static void idt_initialize(void) {
     /* 将 PIC 主片的 IRQ0 映射到 IDT 向量 32。 */
     idt_set_gate(32, irq0);
 
+    /* 将 PIC 主片的 IRQ1 映射到 IDT 向量 33。 */
+    idt_set_gate(33, irq1);
+
     /* 将描述符写入 CPU 的 IDTR，使异常向量 0 到 31 从此由我们的 IDT 处理。 */
     idt_load(&pointer);
 }
@@ -363,8 +384,8 @@ static void pic_remap(void) {
     /* 等待从 PIC 接收模式信息。 */
     io_wait();
 
-    /* 仅打开主 PIC 的 IRQ0，屏蔽 IRQ1 到 IRQ7。 */
-    outb(PIC_MASTER_DATA, 0xFE);
+    /* 打开主 PIC 的 IRQ0 定时器与 IRQ1 键盘，屏蔽 IRQ2 到 IRQ7。 */
+    outb(PIC_MASTER_DATA, 0xFC);
 
     /* 屏蔽从 PIC 的全部 IRQ8 到 IRQ15。 */
     outb(PIC_SLAVE_DATA, 0xFF);
@@ -427,9 +448,47 @@ void timer_handler(void) {
     if (timer_ticks == PIT_FREQUENCY) {
         /* 从零重新开始统计下一秒。 */
         timer_ticks = 0;
+    }
+}
 
-        /* 输出一行文字，证明硬件定时器中断正被持续处理。 */
-        terminal_write("timer IRQ0: one second elapsed\n", COLOR_LIGHT_GREEN);
+/* 将常用 PS/2 Set 1 键盘扫描码转换为未按 Shift 时的 ASCII 字符。 */
+static char keyboard_scancode_to_ascii(uint8_t scancode) {
+    /* 定义扫描码 0x00 到 0x39 的基本 ASCII 映射；未定义项默认是 0。 */
+    static const char map[0x3A] = {
+        0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 0, 0,
+        'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n', 0,
+        'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0, '\\',
+        'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' '
+    };
+
+    /* 如果扫描码超出该基本映射表范围，返回 0 表示暂不处理。 */
+    if (scancode >= sizeof(map)) {
+        /* 通知调用者该扫描码没有对应的字符。 */
+        return '\0';
+    }
+
+    /* 返回扫描码对应的 ASCII 字符，未定义项为 0。 */
+    return map[scancode];
+}
+
+/* 这是 IRQ1 汇编入口调用的 C 函数；每次键盘事件读取一个扫描码。 */
+void keyboard_handler(void) {
+    /* 从键盘控制器端口读取本次按键的 PS/2 Set 1 扫描码。 */
+    const uint8_t scancode = inb(KEYBOARD_DATA_PORT);
+
+    /* 扫描码最高位为 1 表示按键释放事件；第一版只处理按下事件。 */
+    if ((scancode & 0x80) != 0) {
+        /* 忽略按键释放事件。 */
+        return;
+    }
+
+    /* 将按下事件的扫描码翻译为基本 ASCII 字符。 */
+    const char character = keyboard_scancode_to_ascii(scancode);
+
+    /* 只有已映射的字符才输出到内核终端。 */
+    if (character != '\0') {
+        /* 将键盘字符以浅灰色写入当前终端光标位置。 */
+        terminal_putchar(character, COLOR_LIGHT_GREY);
     }
 }
 
@@ -477,8 +536,8 @@ void kernel_main(void) {
     /* 配置可周期性产生 IRQ0 的 PIT 定时器。 */
     pit_initialize();
 
-    /* 输出硬件中断即将开启的状态信息。 */
-    terminal_write("PIT ready; enabling IRQ0 timer...\n", COLOR_LIGHT_GREY);
+    /* 输出定时器与键盘硬件中断即将开启的状态信息。 */
+    terminal_write("PIT ready; enabling IRQ0 timer and IRQ1 keyboard...\n", COLOR_LIGHT_GREY);
 
     /* 在 IDT、PIC 与 PIT 都准备好后，允许 CPU 接收硬件中断。 */
     enable_interrupts();
