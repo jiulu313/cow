@@ -25,7 +25,7 @@ start_stage2:                ; 第 1 阶段执行 jmp 0x0000:0x7E00 后从这里
     mov es, ax               ; ES = 0x1000；读取目标地址的段部分。
     xor bx, bx               ; BX = 0；读取目标地址 ES:BX 就是 0x1000:0x0000，即 0x10000。
     mov ah, 0x02             ; AH = 2；选择 BIOS int 0x13 的“读取扇区”功能。
-    mov al, 0x01             ; AL = 1；当前最小 C 内核只占一个扇区。
+    mov al, 0x08             ; AL = 8；读取第 3 到第 10 扇区，为内核代码和 256 项 IDT 预留 4 KiB 空间。
     mov ch, 0x00             ; CH = 0；读取第 0 个柱面。
     mov cl, 0x03             ; CL = 3；读取第 3 个扇区，前两个扇区分别是 Stage 1 和 Stage 2。
     mov dh, 0x00             ; DH = 0；读取第 0 个磁头。

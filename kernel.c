@@ -4,6 +4,9 @@ typedef unsigned char uint8_t;
 /* 定义 16 位无符号整数类型，用来写 VGA 字符单元。 */
 typedef unsigned short uint16_t;
 
+/* 定义 32 位无符号整数类型，用来保存处理函数地址。 */
+typedef unsigned int uint32_t;
+
 /* VGA 文本模式显存的物理起始地址。 */
 enum { VGA_BUFFER = 0xB8000 };
 
@@ -19,11 +22,50 @@ enum { COLOR_LIGHT_GREY = 0x07 };
 /* VGA 颜色值：黑色背景、浅绿色前景。 */
 enum { COLOR_LIGHT_GREEN = 0x0A };
 
+/* VGA 颜色值：黑色背景、浅红色前景。 */
+enum { COLOR_LIGHT_RED = 0x0C };
+
+/* IDT 中断向量的总数量。 */
+enum { IDT_ENTRIES = 256 };
+
 /* 保存终端下一次输出所在的屏幕行。 */
 static uint16_t terminal_row;
 
 /* 保存终端下一次输出所在的屏幕列。 */
 static uint16_t terminal_column;
+
+/* 声明汇编文件提供的“除以零异常”入口地址。 */
+extern void isr_divide_by_zero(void);
+
+/* 定义 IDT 中单个 8 字节门描述符的内存布局。 */
+struct idt_entry {
+    /* 保存处理函数地址的低 16 位。 */
+    uint16_t offset_low;
+
+    /* 保存处理函数所在代码段的选择子。 */
+    uint16_t selector;
+
+    /* 此字节必须为 0。 */
+    uint8_t zero;
+
+    /* 保存门类型、特权级与“存在”标志。 */
+    uint8_t type_attributes;
+
+    /* 保存处理函数地址的高 16 位。 */
+    uint16_t offset_high;
+} __attribute__((packed));
+
+/* 定义 lidt 指令需要的 6 字节 IDT 描述符布局。 */
+struct idt_pointer {
+    /* 保存 IDT 总字节数减 1。 */
+    uint16_t limit;
+
+    /* 保存 IDT 在内存中的线性地址。 */
+    uint32_t base;
+} __attribute__((packed));
+
+/* 为 256 个中断向量预留门描述符；此数组位于 BSS。 */
+static struct idt_entry idt[IDT_ENTRIES];
 
 /* 将一个 ASCII 字符与一个 VGA 颜色属性合成为一个 16 位字符单元。 */
 static uint16_t vga_entry(char character, uint8_t color) {
@@ -175,6 +217,69 @@ static void terminal_write(const char *text, uint8_t color) {
     }
 }
 
+/* 在 IDT 的指定向量位置安装一个 32 位中断门。 */
+static void idt_set_gate(uint8_t vector, void (*handler)(void)) {
+    /* 将函数指针转换为可拆分的 32 位处理函数地址。 */
+    const uint32_t address = (uint32_t)handler;
+
+    /* 将处理函数地址的低 16 位写入门描述符。 */
+    idt[vector].offset_low = (uint16_t)address;
+
+    /* 使用 GDT 中索引为 1 的内核代码段选择子 0x08。 */
+    idt[vector].selector = 0x08;
+
+    /* 按 x86 规范将保留字节写为 0。 */
+    idt[vector].zero = 0;
+
+    /* 设置存在位、特权级 0 与 32 位中断门类型，数值为 0x8E。 */
+    idt[vector].type_attributes = 0x8E;
+
+    /* 将处理函数地址的高 16 位写入门描述符。 */
+    idt[vector].offset_high = (uint16_t)(address >> 16);
+}
+
+/* 将 IDT 描述符地址加载到 CPU 的 IDTR 专用寄存器。 */
+static void idt_load(const struct idt_pointer *pointer) {
+    /* 执行 x86 lidt 指令；它从 pointer 指向的 6 字节结构读取 limit 和 base。 */
+    __asm__ volatile ("lidtl (%0)" : : "r"(pointer) : "memory");
+}
+
+/* 建立并加载当前最小 IDT；目前只安装除以零异常处理函数。 */
+static void idt_initialize(void) {
+    /* 创建 lidt 所需的 IDT 描述符，base 指向 idt 数组。 */
+    const struct idt_pointer pointer = { (uint16_t)(sizeof(idt) - 1), (uint32_t)idt };
+
+    /* 将 CPU 异常向量 0 连接到汇编异常入口。 */
+    idt_set_gate(0, isr_divide_by_zero);
+
+    /* 将描述符写入 CPU 的 IDTR，使异常向量 0 从此由我们的 IDT 处理。 */
+    idt_load(&pointer);
+}
+
+/* 这是汇编异常入口调用的 C 函数；除以零异常不能安全返回，因此停机。 */
+void divide_by_zero_handler(void) {
+    /* 在终端中留下清晰的异常诊断信息。 */
+    terminal_write("\nEXCEPTION: divide by zero\n", COLOR_LIGHT_RED);
+
+    /* 因异常现场尚未实现恢复逻辑，永久停止 CPU。 */
+    for (;;) {
+        /* 让 CPU 休眠，避免在异常状态下继续执行未知代码。 */
+        __asm__ volatile ("hlt");
+    }
+}
+
+/* 用 x86 的 div 指令故意触发向量 0“除以零”异常，以验证 IDT。 */
+static void trigger_divide_by_zero(void) {
+    /* 将 EDX 设为 0，使它成为除法指令的除数。 */
+    __asm__ volatile ("xor %%edx, %%edx" : : : "edx");
+
+    /* 将 EAX 设为 1，作为被除数的一部分。 */
+    __asm__ volatile ("mov $1, %%eax" : : : "eax");
+
+    /* 执行 32 位无符号除法；除数 EDX 为 0，因此 CPU 触发异常向量 0。 */
+    __asm__ volatile ("div %%edx" : : : "eax", "edx");
+}
+
 /* 将 kernel_main 放入专用的 .text.entry 段，确保它位于内核映像开头。 */
 __attribute__((section(".text.entry")))
 
@@ -194,6 +299,15 @@ void kernel_main(void) {
 
     /* 输出一条说明，提示终端现在可以处理滚屏。 */
     terminal_write("Newline and scrolling are ready.\n", COLOR_LIGHT_GREY);
+
+    /* 建立并加载最小 IDT，使 CPU 能找到我们的除以零异常处理函数。 */
+    idt_initialize();
+
+    /* 提示接下来会主动触发一个受控异常。 */
+    terminal_write("IDT loaded; triggering divide by zero...\n", COLOR_LIGHT_GREY);
+
+    /* 故意执行除以零，以验证 CPU 是否跳进我们的异常入口。 */
+    trigger_divide_by_zero();
 
     /* 内核不能返回到不存在的操作系统，因此永久停在这里。 */
     for (;;) {
