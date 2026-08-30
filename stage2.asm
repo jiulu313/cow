@@ -32,12 +32,42 @@ start_stage2:                ; 第 1 阶段执行 jmp 0x0000:0x7E00 后从这里
     mov dl, [boot_drive]     ; DL 恢复为 BIOS 提供的启动盘编号。
     int 0x13                 ; 将第 3 扇区读入内存地址 0x10000。
     jc .disk_error           ; 若进位标志 CF=1，说明读取失败，跳到停止代码。
+    call .detect_memory_map  ; 在实模式下调用 BIOS E820，获取物理内存布局。
     jmp .enter_protected_mode ; 读取成功后，开始切换到保护模式。
 
 .disk_error:                 ; 读取 C 内核失败时到达这里。
     cli                      ; 关闭可屏蔽中断。
     hlt                      ; 停止 CPU 执行。
     jmp .disk_error          ; 若 CPU 被唤醒，继续停止。
+
+.detect_memory_map:          ; 使用 BIOS int 0x15 的 E820 功能收集物理内存布局。
+    xor ax, ax               ; AX = 0；准备将 DS 与 ES 都设置为低内存段 0。
+    mov ds, ax               ; DS = 0；使固定地址常量直接对应物理地址。
+    mov es, ax               ; ES = 0；E820 条目将被写入物理地址 0x5000 开始的区域。
+    mov word [E820_ENTRY_COUNT_ADDRESS], 0 ; 将已收集的 E820 条目数量清零。
+    xor ebx, ebx             ; EBX = 0；第一次 E820 调用必须使用 0 作为继续标记。
+    mov di, E820_MAP_ADDRESS ; DI = 0x5000；ES:DI 指向第一个 24 字节 E820 条目。
+
+.e820_next:                  ; 循环读取下一条由 BIOS 提供的内存区域描述。
+    mov eax, 0xE820          ; EAX = 0xE820；选择 BIOS 内存地图查询功能。
+    mov edx, 0x534D4150      ; EDX = "SMAP"；这是 E820 接口规定的签名。
+    mov ecx, 24              ; ECX = 24；请求 BIOS 写入扩展 E820 条目的最大字节数。
+    int 0x15                 ; 调用 BIOS；结果条目写入 ES:DI，EBX 返回下一次调用的继续标记。
+    jc .e820_done            ; 若进位标志 CF=1，说明没有更多条目或 BIOS 不支持 E820。
+    cmp eax, 0x534D4150      ; 检查 BIOS 返回的 EAX 是否仍是 "SMAP" 签名。
+    jne .e820_done           ; 如果签名不正确，停止使用该结果。
+    inc word [E820_ENTRY_COUNT_ADDRESS] ; 记录已经成功写入了一条 E820 条目。
+    add di, 24               ; 将目标指针移动到下一个 24 字节条目的起始位置。
+    cmp word [E820_ENTRY_COUNT_ADDRESS], E820_MAX_ENTRIES ; 检查是否已到缓冲区上限。
+    jae .e820_done           ; 如果已收集 32 条，停止以避免写出预留缓冲区。
+    test ebx, ebx            ; BIOS 用 EBX = 0 表示已经返回最后一条。
+    jnz .e820_next           ; 如果 EBX 非 0，继续请求下一条内存区域。
+
+.e820_done:                  ; E820 查询完成或提前失败后到达这里。
+    xor ax, ax               ; AX = 0；重新准备保护模式前需要的段值。
+    mov ds, ax               ; 重新确保 DS = 0，避免 BIOS 实现改变段寄存器造成后续错误。
+    mov es, ax               ; 重新确保 ES = 0，避免 BIOS 实现改变段寄存器造成后续错误。
+    ret                      ; 返回 .load_kernel，继续进入保护模式。
 
 .enter_protected_mode:       ; 字符串显示完成；以下代码将 CPU 切换为 32 位保护模式。
     cli                      ; 关闭可屏蔽中断；我们尚未建立保护模式下的中断表 IDT。
@@ -96,5 +126,8 @@ gdt_descriptor:              ; lgdt 指令需要的 6 字节 GDT 描述符。
 CODE_SEG equ gdt_code - gdt_start ; 代码段在 GDT 中的偏移为 8，即代码段选择子 0x08。
 DATA_SEG equ gdt_data - gdt_start ; 数据段在 GDT 中的偏移为 16，即数据段选择子 0x10。
 KERNEL_ENTRY equ 0x10000      ; C 内核的链接地址，也是 BIOS int 0x13 读取它的物理地址。
+E820_ENTRY_COUNT_ADDRESS equ 0x4FF0 ; 保存 E820 条目数量的低内存物理地址。
+E820_MAP_ADDRESS equ 0x5000   ; 保存 E820 条目数组的低内存物理地址。
+E820_MAX_ENTRIES equ 32       ; 当前低内存缓冲区最多容纳 32 条 E820 条目。
 
 times 512 - ($ - $$) db 0   ; 用 0 填满本扇区，使本文件严格等于 512 字节。

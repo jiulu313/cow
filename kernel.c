@@ -55,6 +55,18 @@ enum { KEYBOARD_BUFFER_SIZE = 128 };
 /* 键盘环形缓冲区的掩码，用于将索引限制在 0 到 127。 */
 enum { KEYBOARD_BUFFER_MASK = KEYBOARD_BUFFER_SIZE - 1 };
 
+/* Stage 2 在低内存中保存 E820 条目数量的地址。 */
+enum { E820_ENTRY_COUNT_ADDRESS = 0x4FF0 };
+
+/* Stage 2 在低内存中保存 E820 条目数组的地址。 */
+enum { E820_MAP_ADDRESS = 0x5000 };
+
+/* 与 Stage 2 保持一致的 E820 条目数量上限。 */
+enum { E820_MAX_ENTRIES = 32 };
+
+/* 一条内核命令可输入的最大字符数，最后一个字节留给字符串结束标记。 */
+enum { COMMAND_BUFFER_SIZE = 80 };
+
 /* IDT 中断向量的总数量。 */
 enum { IDT_ENTRIES = 256 };
 
@@ -84,6 +96,39 @@ static volatile uint8_t keyboard_head;
 
 /* 保存下一次键盘字符读取的位置；内核主循环是唯一读取者。 */
 static volatile uint8_t keyboard_tail;
+
+/* 保存用户正在输入、但尚未按 Enter 提交的一行命令。 */
+static char command_buffer[COMMAND_BUFFER_SIZE];
+
+/* 保存当前命令行已经输入的字符数量。 */
+static uint16_t command_length;
+
+/* 定义 BIOS E820 返回的 24 字节内存区域描述格式。 */
+struct e820_entry {
+    /* 保存物理区域起始地址的低 32 位。 */
+    uint32_t base_low;
+
+    /* 保存物理区域起始地址的高 32 位。 */
+    uint32_t base_high;
+
+    /* 保存物理区域长度的低 32 位。 */
+    uint32_t length_low;
+
+    /* 保存物理区域长度的高 32 位。 */
+    uint32_t length_high;
+
+    /* 保存区域类型；1 表示可用 RAM。 */
+    uint32_t type;
+
+    /* 保存扩展属性；当前第一版不使用该字段。 */
+    uint32_t attributes;
+} __attribute__((packed));
+
+/* 指向 Stage 2 在低内存保存的 E820 条目数量。 */
+static const volatile uint16_t *const e820_entry_count = (const volatile uint16_t *)E820_ENTRY_COUNT_ADDRESS;
+
+/* 指向 Stage 2 在低内存保存的 E820 条目数组。 */
+static const volatile struct e820_entry *const e820_entries = (const volatile struct e820_entry *)E820_MAP_ADDRESS;
 
 /* 定义 IDT 中单个 8 字节门描述符的内存布局。 */
 struct idt_entry {
@@ -268,6 +313,27 @@ static void terminal_putchar(char character, uint8_t color) {
     terminal_update_cursor();
 }
 
+/* 删除当前行光标前的一个字符；第一版不跨行删除。 */
+static void terminal_backspace(void) {
+    /* 如果光标已经位于第 0 列，则没有可删除字符。 */
+    if (terminal_column == 0) {
+        /* 直接返回，避免删除上一行内容。 */
+        return;
+    }
+
+    /* 先将光标左移到待删除字符的位置。 */
+    --terminal_column;
+
+    /* 计算待删除字符在 VGA 显存中的线性编号。 */
+    const uint16_t index = terminal_row * VGA_WIDTH + terminal_column;
+
+    /* 用一个浅灰色空格覆盖原来的字符。 */
+    ((volatile uint16_t *)VGA_BUFFER)[index] = vga_entry(' ', COLOR_LIGHT_GREY);
+
+    /* 将硬件光标同步到删除后的新位置。 */
+    terminal_update_cursor();
+}
+
 /* 从当前光标位置开始，以给定颜色输出一个以 0 结尾的字符串。 */
 static void terminal_write(const char *text, uint8_t color) {
     /* 从字符串的第 0 个字符开始读取。 */
@@ -298,6 +364,51 @@ static void terminal_write_hex32(uint32_t value, uint8_t color) {
 
         /* 输出该数字对应的十六进制 ASCII 字符。 */
         terminal_putchar(digits[digit], color);
+    }
+}
+
+/* 显示 Stage 2 通过 BIOS E820 收集到的物理内存区域。 */
+static void memory_report(void) {
+    /* 读取 Stage 2 已成功保存的 E820 条目数量。 */
+    const uint16_t count = *e820_entry_count;
+
+    /* 输出内存地图标题。 */
+    terminal_write("E820 memory map\n", COLOR_LIGHT_GREEN);
+
+    /* 输出条目数量标签。 */
+    terminal_write("entries: ", COLOR_LIGHT_GREY);
+
+    /* 用十六进制输出条目数量。 */
+    terminal_write_hex32(count, COLOR_LIGHT_GREY);
+
+    /* 条目数量输出完成后换行。 */
+    terminal_write("\n", COLOR_LIGHT_GREY);
+
+    /* 逐项显示由 BIOS 返回的物理内存区域。 */
+    for (uint16_t index = 0; index < count && index < E820_MAX_ENTRIES; ++index) {
+        /* 取得当前 E820 区域条目的地址。 */
+        const volatile struct e820_entry *entry = &e820_entries[index];
+
+        /* 输出当前区域的起始地址标签。 */
+        terminal_write("base: ", COLOR_LIGHT_GREY);
+
+        /* 第一版显示起始地址低 32 位；当前 32 位内核主要使用此范围。 */
+        terminal_write_hex32(entry->base_low, COLOR_LIGHT_GREY);
+
+        /* 输出当前区域长度标签。 */
+        terminal_write(" length: ", COLOR_LIGHT_GREY);
+
+        /* 第一版显示长度低 32 位。 */
+        terminal_write_hex32(entry->length_low, COLOR_LIGHT_GREY);
+
+        /* 输出当前区域类型标签。 */
+        terminal_write(" type: ", COLOR_LIGHT_GREY);
+
+        /* 输出区域类型；值 1 表示可用 RAM。 */
+        terminal_write_hex32(entry->type, COLOR_LIGHT_GREY);
+
+        /* 当前区域输出完成后换行。 */
+        terminal_write("\n", COLOR_LIGHT_GREY);
     }
 }
 
@@ -470,7 +581,7 @@ void timer_handler(void) {
 static char keyboard_scancode_to_ascii(uint8_t scancode) {
     /* 定义扫描码 0x00 到 0x39 的基本 ASCII 映射；未定义项默认是 0。 */
     static const char map[0x3A] = {
-        0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 0, 0,
+        0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b', 0,
         'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n', 0,
         'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0, '\\',
         'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' '
@@ -520,6 +631,132 @@ static char keyboard_buffer_pop(void) {
 
     /* 将读取到的字符返回给内核主循环。 */
     return character;
+}
+
+/* 比较两个以 0 结尾的字符串是否完全相同。 */
+static uint8_t string_equal(const char *left, const char *right) {
+    /* 从两个字符串的第 0 个字符开始比较。 */
+    uint16_t index = 0;
+
+    /* 只要当前字符相同，就继续比较下一个字符。 */
+    while (left[index] == right[index]) {
+        /* 如果相同字符恰好是结束标记，两个字符串完全相同。 */
+        if (left[index] == '\0') {
+            /* 返回 1 表示字符串相等。 */
+            return 1;
+        }
+
+        /* 移动到下一个字符位置。 */
+        ++index;
+    }
+
+    /* 发现不同字符，返回 0 表示字符串不相等。 */
+    return 0;
+}
+
+/* 输出命令行提示符，表示内核正在等待一条新命令。 */
+static void shell_prompt(void) {
+    /* 用绿色输出提示符。 */
+    terminal_write("cow> ", COLOR_LIGHT_GREEN);
+}
+
+/* 执行已提交的命令行；当前支持 help、clear 与 mem。 */
+static void shell_execute_command(void) {
+    /* 处理空行，不额外输出任何文字。 */
+    if (command_length == 0) {
+        /* 空行无需执行命令，直接返回。 */
+        return;
+    }
+
+    /* 如果命令是 help，显示当前已支持的命令。 */
+    if (string_equal(command_buffer, "help")) {
+        /* 输出帮助信息。 */
+        terminal_write("commands: help, clear, mem\n", COLOR_LIGHT_GREY);
+
+        /* help 已处理完成。 */
+        return;
+    }
+
+    /* 如果命令是 clear，清除整个终端。 */
+    if (string_equal(command_buffer, "clear")) {
+        /* 清屏同时会把终端光标重置到左上角。 */
+        terminal_clear();
+
+        /* clear 已处理完成。 */
+        return;
+    }
+
+    /* 如果命令是 mem，显示 BIOS E820 提供的物理内存地图。 */
+    if (string_equal(command_buffer, "mem")) {
+        /* 输出 E820 内存区域报告。 */
+        memory_report();
+
+        /* mem 已处理完成。 */
+        return;
+    }
+
+    /* 对未识别命令显示错误提示。 */
+    terminal_write("unknown command: ", COLOR_LIGHT_RED);
+
+    /* 回显用户输入的未识别命令。 */
+    terminal_write(command_buffer, COLOR_LIGHT_RED);
+
+    /* 输出错误信息的换行。 */
+    terminal_write("\n", COLOR_LIGHT_RED);
+}
+
+/* 处理从键盘缓冲区取出的一个字符，并更新命令行状态。 */
+static void shell_handle_character(char character) {
+    /* Enter 表示用户提交当前命令。 */
+    if (character == '\n') {
+        /* 将当前命令缓冲区变成合法的以 0 结尾 C 字符串。 */
+        command_buffer[command_length] = '\0';
+
+        /* 在终端中开始新的一行，用于显示命令结果。 */
+        terminal_newline();
+
+        /* 执行刚刚提交的命令。 */
+        shell_execute_command();
+
+        /* 清空命令长度，为下一行命令重新开始。 */
+        command_length = 0;
+
+        /* 输出下一条命令的提示符。 */
+        shell_prompt();
+
+        /* Enter 已处理完毕，因此返回。 */
+        return;
+    }
+
+    /* Backspace 表示删除尚未提交命令的最后一个字符。 */
+    if (character == '\b') {
+        /* 只有当前命令不为空时才能删除字符。 */
+        if (command_length != 0) {
+            /* 缩短命令缓冲区。 */
+            --command_length;
+
+            /* 删除终端中对应的最后一个字符。 */
+            terminal_backspace();
+        }
+
+        /* Backspace 已处理完毕，因此返回。 */
+        return;
+    }
+
+    /* 如果命令缓冲区只剩下结束标记的位置，不再接受更多字符。 */
+    if (command_length == COMMAND_BUFFER_SIZE - 1) {
+        /* 直接返回，防止写越过 command_buffer 的边界。 */
+        return;
+    }
+
+    /* 将普通字符追加到当前命令缓冲区的末尾。 */
+    command_buffer[command_length] = character;
+
+    /* 记录命令缓冲区现在多了一个字符。 */
+    ++command_length;
+
+    /* 将普通字符立即回显到内核终端。 */
+    terminal_putchar(character, COLOR_LIGHT_GREY);
 }
 
 /* 这是 IRQ1 汇编入口调用的 C 函数；每次键盘事件读取一个扫描码。 */
@@ -593,15 +830,18 @@ void kernel_main(void) {
     /* 在 IDT、PIC 与 PIT 都准备好后，允许 CPU 接收硬件中断。 */
     enable_interrupts();
 
+    /* 显示第一条命令行提示符。 */
+    shell_prompt();
+
     /* 内核主循环持续消费键盘缓冲区中的字符。 */
     for (;;) {
         /* 从键盘环形缓冲区尝试取出一个字符。 */
         const char character = keyboard_buffer_pop();
 
-        /* 如果读到了一个有效字符，将它回显到内核终端。 */
+        /* 如果读到了一个有效字符，将它交给命令行编辑器处理。 */
         if (character != '\0') {
-            /* 在非中断上下文中安全调用终端输出函数。 */
-            terminal_putchar(character, COLOR_LIGHT_GREY);
+            /* 在非中断上下文中处理普通字符、Enter 或 Backspace。 */
+            shell_handle_character(character);
 
             /* 已处理一个字符，立即继续检查缓冲区是否还有更多输入。 */
             continue;
